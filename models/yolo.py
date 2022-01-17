@@ -257,13 +257,13 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                 BottleneckCSP, C3, C3TR, C3SPP, C3Ghost]:
+                 BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, ResBlock]:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in [BottleneckCSP, C3, C3TR, C3Ghost]:
+            if m in [BottleneckCSP, C3, C3TR, C3Ghost, ResBlock]:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
@@ -290,6 +290,8 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         layers.append(m_)
         if i == 0:
             ch = []
+        if m in [ResBlock] and args[3] == ResBottleneck:
+            c2 *= 4
         ch.append(c2)
     return nn.Sequential(*layers), sorted(save)
 
