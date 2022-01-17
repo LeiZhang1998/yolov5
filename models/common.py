@@ -3,14 +3,12 @@
 Common modules
 """
 
-import json
+import logging
 import math
-import platform
 import warnings
 from copy import copy
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pandas as pd
 import requests
@@ -18,12 +16,17 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torch.cuda import amp
+from torch.nn import functional as F
+import torchvision
+from torchvision.transforms import functional as tf
 
-from utils.datasets import exif_transpose, letterbox
-from utils.general import (LOGGER, check_requirements, check_suffix, colorstr, increment_path, make_divisible,
-                           non_max_suppression, scale_coords, xywh2xyxy, xyxy2xywh)
-from utils.plots import Annotator, colors, save_one_box
-from utils.torch_utils import time_sync
+from ..utils.datasets import exif_transpose, letterbox
+from ..utils.general import colorstr, increment_path, make_divisible, non_max_suppression, save_one_box, \
+    scale_coords, xyxy2xywh
+from ..utils.plots import Annotator, colors
+from ..utils.torch_utils import time_sync
+
+LOGGER = logging.getLogger(__name__)
 
 
 def autopad(k, p=None):  # kernel, padding
@@ -39,7 +42,7 @@ class Conv(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.ReLU(inplace=True))
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -79,15 +82,29 @@ class TransformerBlock(nn.Module):
         if c1 != c2:
             self.conv = Conv(c1, c2)
         self.linear = nn.Linear(c2, c2)  # learnable position embedding
-        self.tr = nn.Sequential(*(TransformerLayer(c2, num_heads) for _ in range(num_layers)))
+        self.tr = nn.Sequential(*[TransformerLayer(c2, num_heads) for _ in range(num_layers)])
         self.c2 = c2
 
     def forward(self, x):
         if self.conv is not None:
             x = self.conv(x)
         b, _, w, h = x.shape
-        p = x.flatten(2).permute(2, 0, 1)
-        return self.tr(p + self.linear(p)).permute(1, 2, 0).reshape(b, self.c2, w, h)
+        p = x.flatten(2).unsqueeze(0).transpose(0, 3).squeeze(3)
+        return self.tr(p + self.linear(p)).unsqueeze(3).transpose(0, 3).reshape(b, self.c2, w, h)
+
+
+class TransAttention(nn.Module):
+    def __init__(self, c1=12, c2=3):
+        super(TransAttention, self).__init__()
+        self.conv1_1 = nn.Conv2d(c1, c2, kernel_size=1, stride=1)
+
+    def forward(self, x):
+        x_1 = tf.rotate(x, 90.0)
+        x_2 = tf.rotate(x, 180.0)
+        x_3 = tf.rotate(x, 270.0)
+        out = torch.cat([x, x_1, x_2, x_3], dim=1)
+        # out = self.conv1_1(out)
+        return out
 
 
 class Bottleneck(nn.Module):
@@ -113,8 +130,8 @@ class BottleneckCSP(nn.Module):
         self.cv3 = nn.Conv2d(c_, c_, 1, 1, bias=False)
         self.cv4 = Conv(2 * c_, c2, 1, 1)
         self.bn = nn.BatchNorm2d(2 * c_)  # applied to cat(cv2, cv3)
-        self.act = nn.SiLU()
-        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.act = nn.LeakyReLU(0.1, inplace=True)
+        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
 
     def forward(self, x):
         y1 = self.cv3(self.m(self.cv1(x)))
@@ -130,7 +147,7 @@ class C3(nn.Module):
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)  # act=FReLU(c2)
-        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
         # self.m = nn.Sequential(*[CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)])
 
     def forward(self, x):
@@ -158,7 +175,7 @@ class C3Ghost(C3):
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)  # hidden channels
-        self.m = nn.Sequential(*(GhostBottleneck(c_, c_) for _ in range(n)))
+        self.m = nn.Sequential(*[GhostBottleneck(c_, c_) for _ in range(n)])
 
 
 class SPP(nn.Module):
@@ -273,128 +290,6 @@ class Concat(nn.Module):
         return torch.cat(x, self.d)
 
 
-class DetectMultiBackend(nn.Module):
-    # YOLOv5 MultiBackend class for python inference on various backends
-    def __init__(self, weights='yolov5s.pt', device=None, dnn=True):
-        # Usage:
-        #   PyTorch:      weights = *.pt
-        #   TorchScript:            *.torchscript.pt
-        #   CoreML:                 *.mlmodel
-        #   TensorFlow:             *_saved_model
-        #   TensorFlow:             *.pb
-        #   TensorFlow Lite:        *.tflite
-        #   ONNX Runtime:           *.onnx
-        #   OpenCV DNN:             *.onnx with dnn=True
-        super().__init__()
-        w = str(weights[0] if isinstance(weights, list) else weights)
-        suffix, suffixes = Path(w).suffix.lower(), ['.pt', '.onnx', '.tflite', '.pb', '', '.mlmodel']
-        check_suffix(w, suffixes)  # check weights have acceptable suffix
-        pt, onnx, tflite, pb, saved_model, coreml = (suffix == x for x in suffixes)  # backend booleans
-        jit = pt and 'torchscript' in w.lower()
-        stride, names = 64, [f'class{i}' for i in range(1000)]  # assign defaults
-
-        if jit:  # TorchScript
-            LOGGER.info(f'Loading {w} for TorchScript inference...')
-            extra_files = {'config.txt': ''}  # model metadata
-            model = torch.jit.load(w, _extra_files=extra_files)
-            if extra_files['config.txt']:
-                d = json.loads(extra_files['config.txt'])  # extra_files dict
-                stride, names = int(d['stride']), d['names']
-        elif pt:  # PyTorch
-            from models.experimental import attempt_load  # scoped to avoid circular import
-            model = torch.jit.load(w) if 'torchscript' in w else attempt_load(weights, map_location=device)
-            stride = int(model.stride.max())  # model stride
-            names = model.module.names if hasattr(model, 'module') else model.names  # get class names
-        elif coreml:  # CoreML *.mlmodel
-            import coremltools as ct
-            model = ct.models.MLModel(w)
-        elif dnn:  # ONNX OpenCV DNN
-            LOGGER.info(f'Loading {w} for ONNX OpenCV DNN inference...')
-            check_requirements(('opencv-python>=4.5.4',))
-            net = cv2.dnn.readNetFromONNX(w)
-        elif onnx:  # ONNX Runtime
-            LOGGER.info(f'Loading {w} for ONNX Runtime inference...')
-            check_requirements(('onnx', 'onnxruntime-gpu' if torch.has_cuda else 'onnxruntime'))
-            import onnxruntime
-            session = onnxruntime.InferenceSession(w, None)
-        else:  # TensorFlow model (TFLite, pb, saved_model)
-            import tensorflow as tf
-            if pb:  # https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
-                def wrap_frozen_graph(gd, inputs, outputs):
-                    x = tf.compat.v1.wrap_function(lambda: tf.compat.v1.import_graph_def(gd, name=""), [])  # wrapped
-                    return x.prune(tf.nest.map_structure(x.graph.as_graph_element, inputs),
-                                   tf.nest.map_structure(x.graph.as_graph_element, outputs))
-
-                LOGGER.info(f'Loading {w} for TensorFlow *.pb inference...')
-                graph_def = tf.Graph().as_graph_def()
-                graph_def.ParseFromString(open(w, 'rb').read())
-                frozen_func = wrap_frozen_graph(gd=graph_def, inputs="x:0", outputs="Identity:0")
-            elif saved_model:
-                LOGGER.info(f'Loading {w} for TensorFlow saved_model inference...')
-                model = tf.keras.models.load_model(w)
-            elif tflite:  # https://www.tensorflow.org/lite/guide/python#install_tensorflow_lite_for_python
-                if 'edgetpu' in w.lower():
-                    LOGGER.info(f'Loading {w} for TensorFlow Edge TPU inference...')
-                    import tflite_runtime.interpreter as tfli
-                    delegate = {'Linux': 'libedgetpu.so.1',  # install https://coral.ai/software/#edgetpu-runtime
-                                'Darwin': 'libedgetpu.1.dylib',
-                                'Windows': 'edgetpu.dll'}[platform.system()]
-                    interpreter = tfli.Interpreter(model_path=w, experimental_delegates=[tfli.load_delegate(delegate)])
-                else:
-                    LOGGER.info(f'Loading {w} for TensorFlow Lite inference...')
-                    interpreter = tf.lite.Interpreter(model_path=w)  # load TFLite model
-                interpreter.allocate_tensors()  # allocate
-                input_details = interpreter.get_input_details()  # inputs
-                output_details = interpreter.get_output_details()  # outputs
-        self.__dict__.update(locals())  # assign all variables to self
-
-    def forward(self, im, augment=False, visualize=False, val=False):
-        # YOLOv5 MultiBackend inference
-        b, ch, h, w = im.shape  # batch, channel, height, width
-        if self.pt:  # PyTorch
-            y = self.model(im) if self.jit else self.model(im, augment=augment, visualize=visualize)
-            return y if val else y[0]
-        elif self.coreml:  # CoreML *.mlmodel
-            im = im.permute(0, 2, 3, 1).cpu().numpy()  # torch BCHW to numpy BHWC shape(1,320,192,3)
-            im = Image.fromarray((im[0] * 255).astype('uint8'))
-            # im = im.resize((192, 320), Image.ANTIALIAS)
-            y = self.model.predict({'image': im})  # coordinates are xywh normalized
-            box = xywh2xyxy(y['coordinates'] * [[w, h, w, h]])  # xyxy pixels
-            conf, cls = y['confidence'].max(1), y['confidence'].argmax(1).astype(np.float)
-            y = np.concatenate((box, conf.reshape(-1, 1), cls.reshape(-1, 1)), 1)
-        elif self.onnx:  # ONNX
-            im = im.cpu().numpy()  # torch to numpy
-            if self.dnn:  # ONNX OpenCV DNN
-                self.net.setInput(im)
-                y = self.net.forward()
-            else:  # ONNX Runtime
-                y = self.session.run([self.session.get_outputs()[0].name], {self.session.get_inputs()[0].name: im})[0]
-        else:  # TensorFlow model (TFLite, pb, saved_model)
-            im = im.permute(0, 2, 3, 1).cpu().numpy()  # torch BCHW to numpy BHWC shape(1,320,192,3)
-            if self.pb:
-                y = self.frozen_func(x=self.tf.constant(im)).numpy()
-            elif self.saved_model:
-                y = self.model(im, training=False).numpy()
-            elif self.tflite:
-                input, output = self.input_details[0], self.output_details[0]
-                int8 = input['dtype'] == np.uint8  # is TFLite quantized uint8 model
-                if int8:
-                    scale, zero_point = input['quantization']
-                    im = (im / scale + zero_point).astype(np.uint8)  # de-scale
-                self.interpreter.set_tensor(input['index'], im)
-                self.interpreter.invoke()
-                y = self.interpreter.get_tensor(output['index'])
-                if int8:
-                    scale, zero_point = output['quantization']
-                    y = (y.astype(np.float32) - zero_point) * scale  # re-scale
-            y[..., 0] *= w  # x
-            y[..., 1] *= h  # y
-            y[..., 2] *= w  # w
-            y[..., 3] *= h  # h
-        y = torch.tensor(y)
-        return (y, []) if val else y
-
-
 class AutoShape(nn.Module):
     # YOLOv5 input-robust model wrapper for passing cv2/np/PIL/torch inputs. Includes preprocessing, inference and NMS
     conf = 0.25  # NMS confidence threshold
@@ -461,7 +356,7 @@ class AutoShape(nn.Module):
         x = [letterbox(im, new_shape=shape1, auto=False)[0] for im in imgs]  # pad
         x = np.stack(x, 0) if n > 1 else x[0][None]  # stack
         x = np.ascontiguousarray(x.transpose((0, 3, 1, 2)))  # BHWC to BCHW
-        x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32
+        x = torch.from_numpy(x).to(p.device).type_as(p) / 255.  # uint8 to fp16/32
         t.append(time_sync())
 
         with amp.autocast(enabled=p.device.type != 'cpu'):
@@ -484,7 +379,7 @@ class Detections:
     def __init__(self, imgs, pred, files, times=None, names=None, shape=None):
         super().__init__()
         d = pred[0].device  # device
-        gn = [torch.tensor([*(im.shape[i] for i in [1, 0, 1, 0]), 1, 1], device=d) for im in imgs]  # normalizations
+        gn = [torch.tensor([*[im.shape[i] for i in [1, 0, 1, 0]], 1., 1.], device=d) for im in imgs]  # normalizations
         self.imgs = imgs  # list of images as numpy arrays
         self.pred = pred  # list of tensors pred[0] = (xyxy, conf, cls)
         self.names = names  # class names
@@ -589,3 +484,287 @@ class Classify(nn.Module):
     def forward(self, x):
         z = torch.cat([self.aap(y) for y in (x if isinstance(x, list) else [x])], 1)  # cat if list
         return self.flat(self.conv(z))  # flatten to x(b,c2)
+
+
+class Mlp(nn.Module):
+    "Implementation of MLP"
+
+    def __init__(self, in_features, hidden_features=None,
+                 out_features=None, act_layer=nn.GELU,
+                 drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class OutlookAttention(nn.Module):
+    """
+    Implementation of outlook attention
+    --dim: hidden dim
+    --num_heads: number of heads
+    --kernel_size: kernel size in each window for outlook attention
+    return: token features after outlook attention
+    """
+
+    def __init__(self, dim, num_heads, kernel_size=3, padding=1, stride=1,
+                 qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        head_dim = dim // num_heads
+        self.num_heads = num_heads
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.stride = stride
+        self.scale = qk_scale or head_dim**-0.5
+
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+        self.attn = nn.Linear(dim, kernel_size**4 * num_heads)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.unfold = nn.Unfold(kernel_size=kernel_size, padding=padding, stride=stride)
+        self.pool = nn.AvgPool2d(kernel_size=stride, stride=stride, ceil_mode=True)
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+
+        v = self.v(x).permute(0, 3, 1, 2)  # B, C, H, W
+
+        h, w = math.ceil(H / self.stride), math.ceil(W / self.stride)
+        v = self.unfold(v).reshape(B, self.num_heads, C // self.num_heads,
+                                   self.kernel_size * self.kernel_size,
+                                   h * w).permute(0, 1, 4, 3, 2)  # B,H,N,kxk,C/H [1, 6, 196, 9, 32]
+
+        attn = self.pool(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        attn = self.attn(attn).reshape(
+            B, h * w, self.num_heads, self.kernel_size * self.kernel_size,
+            self.kernel_size * self.kernel_size).permute(0, 2, 1, 3, 4)  # B,H,N,kxk,kxk [1, 6, 196, 9, 9]
+        attn = attn * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).permute(0, 1, 4, 3, 2).reshape(
+            B, C * self.kernel_size * self.kernel_size, h * w)
+        x = F.fold(x, output_size=(H, W), kernel_size=self.kernel_size,
+                   padding=self.padding, stride=self.stride)
+
+        x = self.proj(x.permute(0, 2, 3, 1))
+        x = self.proj_drop(x)
+
+        return x
+
+
+class Outlooker(nn.Module):
+    """
+    Implementation of outlooker layer: which includes outlook attention + MLP
+    Outlooker is the first stage in our VOLO
+    --dim: hidden dim
+    --num_heads: number of heads
+    --mlp_ratio: mlp ratio
+    --kernel_size: kernel size in each window for outlook attention
+    return: outlooker layer
+    """
+    def __init__(self, dim, kernel_size, padding, stride=1,
+                 num_heads=1,mlp_ratio=3., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU,
+                 norm_layer=nn.LayerNorm, qkv_bias=False,
+                 qk_scale=None):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = OutlookAttention(dim, num_heads, kernel_size=kernel_size,
+                                     padding=padding, stride=stride,
+                                     qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                     attn_drop=attn_drop)
+
+        self.drop_path = nn.Identity()
+
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim,
+                       hidden_features=mlp_hidden_dim,
+                       act_layer=act_layer)
+
+    def forward(self, x):
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class LocalAttention(nn.Module):
+    def __init__(self, k, s):
+        super(LocalAttention, self).__init__()
+        self.unfolde = nn.Unfold(kernel_size=k, dilation=1, padding=autopad(k, s), stride=s)
+
+    def forward(self, x):
+        input = x
+        x = self.unfolde(x)
+
+
+def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
+
+
+def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+
+class ResBasicBlock(nn.Module):
+    expansion: int = 1
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        stride: int = 1,
+        downsample = None,
+        groups: int = 1,
+        base_width: int = 64,
+        dilation: int = 1,
+        norm_layer=None
+    ) -> None:
+        super(ResBasicBlock, self).__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        if groups != 1 or base_width != 64:
+            raise ValueError('BasicBlock only supports groups=1 and base_width=64')
+        if dilation > 1:
+            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
+        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv3x3(c1, c2, stride)
+        self.bn1 = norm_layer(c2)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(c2, c2)
+        self.bn2 = norm_layer(c2)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class ResBottleneck(nn.Module):
+    # Bottleneck in torchvision places the stride for downsampling at 3x3 convolution(self.conv2)
+    # while original implementation places the stride at the first 1x1 convolution(self.conv1)
+    # according to "Deep residual learning for image recognition"https://arxiv.org/abs/1512.03385.
+    # This variant is also known as ResNet V1.5 and improves accuracy according to
+    # https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_pytorch.
+
+    expansion: int = 4
+
+    def __init__(
+        self,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample = None,
+        groups: int = 1,
+        base_width: int = 64,
+        dilation: int = 1,
+        norm_layer = None
+    ) -> None:
+        super(ResBottleneck, self).__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        width = int(planes * (base_width / 64.)) * groups
+        # Both self.conv2 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv1x1(inplanes, width)
+        self.bn1 = norm_layer(width)
+        self.conv2 = conv3x3(width, width, stride, groups, dilation)
+        self.bn2 = norm_layer(width)
+        self.conv3 = conv1x1(width, planes * self.expansion)
+        self.bn3 = norm_layer(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class ResBlock(nn.Module):
+    def __init__(self, c1, c2, num, block, stride=1, dilate: bool = False):
+        super(ResBlock, self).__init__()
+        self.groups = 1
+        self.block = block
+        self._norm_layer = nn.BatchNorm2d
+        self.dilation = 1
+        self.base_width = 64
+        self.layer = self._make_layer(c1, c2, num, stride)
+
+    def _make_layer(self, c1, c2, num, stride: int = 1, dilate: bool = False) -> nn.Sequential:
+        norm_layer = self._norm_layer
+        downsample = None
+        previous_dilation = self.dilation
+        if dilate:
+            self.dilation *= stride
+            stride = 1
+        if stride != 1 or c1 != c2 * self.block.expansion:
+            downsample = nn.Sequential(
+                conv1x1(c1, c2 * self.block.expansion, stride),
+                norm_layer(c2 * self.block.expansion),
+            )
+
+        layers = []
+        layers.append(self.block(c1, c2, stride, downsample, self.groups,
+                            self.base_width, previous_dilation, norm_layer))
+        inplanes = c2 * self.block.expansion
+        for _ in range(1, num):
+            layers.append(self.block(inplanes, c2, groups=self.groups,
+                                base_width=self.base_width, dilation=self.dilation,
+                                norm_layer=norm_layer))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.layer(x)
+        return x
